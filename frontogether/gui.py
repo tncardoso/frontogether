@@ -1,9 +1,10 @@
 import sys
+import os
 import logging
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
 from PySide6.QtWidgets import QVBoxLayout, QHBoxLayout, QTextEdit
 from PySide6.QtWidgets import QLineEdit, QPushButton, QSplitter
-from PySide6.QtWidgets import QCheckBox
+from PySide6.QtWidgets import QCheckBox, QTreeView, QFileSystemModel
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtGui import QPixmap
 from PySide6.QtCore import Qt, QUrl, QThreadPool, QRunnable, Slot, Signal
@@ -17,7 +18,7 @@ from frontogether.canvas import Canvas
 class FrontogetherGui(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("frontender")
+        self.setWindowTitle("Frontogether")
         self.setGeometry(100, 100, 1200, 800)
 
         self._agent = Agent()
@@ -40,7 +41,7 @@ class FrontogetherGui(QMainWindow):
         chat_layout = QVBoxLayout(chat_widget)
         self._chat = QTextEdit()
         self._chat.setReadOnly(True)
-        self._chat.insertPlainText(f"[frontogether]\n")
+        self.banner()
         chat_layout.addWidget(self._chat)
 
         # chat input
@@ -60,9 +61,19 @@ class FrontogetherGui(QMainWindow):
         chat_file_splitter.addWidget(chat_widget)
 
         # opened file input
-        self._editor = QTextEdit()
-        chat_file_splitter.addWidget(self._editor)
+        file_viewer_widget = QWidget()
+        file_viewer_layout = QHBoxLayout(file_viewer_widget)
+        self._file_tree = QTreeView()
+        self._file_tree.setModel(QFileSystemModel())
+        self._file_tree.setRootIndex(self._file_tree.model().setRootPath(os.getcwd()))
+        self._file_tree.selectionModel().selectionChanged.connect(self.on_file_select)
+        file_viewer_layout.addWidget(self._file_tree)
 
+        self._editor = QTextEdit()
+        self._editor.setReadOnly(True)
+        file_viewer_layout.addWidget(self._editor)
+        chat_file_splitter.addWidget(file_viewer_widget)
+        
         # right pane
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
@@ -108,6 +119,22 @@ class FrontogetherGui(QMainWindow):
         self._server.stop()
         event.accept()
 
+    def banner(self):
+        b = """
+   ,d8888b                                                                     d8b                      
+   88P'                                 d8P                              d8P   ?88                      
+d888888P                             d888888P                         d888888P  88b                     
+  ?88'      88bd88b d8888b   88bd88b   ?88'   d8888b  d888b8b   d8888b  ?88'    888888b  d8888b  88bd88b
+  88P       88P'  `d8P' ?88  88P' ?8b  88P   d8P' ?88d8P' ?88  d8b_,dP  88P     88P `?8bd8b_,dP  88P'  `
+ d88       d88     88b  d88 d88   88P  88b   88b  d8888b  ,88b 88b      88b    d88   88P88b     d88     
+d88'      d88'     `?8888P'd88'   88b  `?8b  `?8888P'`?88P'`88b`?888P'  `?8b  d88'   88b`?888P'd88'     
+                                                            )88                                         
+                                                           ,88P                                         
+                                                       `?8888P                                          
+        """
+        banner_style = "font-size: 8px; width: 100%; text-align: center;"
+        self.insert_html(f"<br><div style=\"{banner_style}\"><pre>{b}</pre></div>")
+
     def screenshot(self):
         size = self._web_view.contentsRect()
         img = QPixmap(size.width(), size.height())
@@ -120,11 +147,31 @@ class FrontogetherGui(QMainWindow):
         self._canvas.clear()
         self._canvas.update()
 
+    def insert_html(self, msg: str):
+        self._chat.insertHtml(msg)
+
     def insert_text(self, msg: str):
         self._chat.insertPlainText(msg)
+        self.scroll()
+
+    def scroll(self):
+        sbar = self._chat.verticalScrollBar()
+        sbar.setValue(sbar.maximum())
 
     def completed(self):
         self._web_view.load(QUrl("http://localhost:8000"))
+
+    def on_file_select(self):
+        idx = self._file_tree.selectedIndexes()[0]
+        info = self._file_tree.model().fileInfo(idx)
+        path = info.absoluteFilePath()
+
+        try:
+            with open(path, "r") as f:
+                self._editor.setPlainText(f.read())
+        except UnicodeDecodeError:
+            self._editor.setPlainText("binary file")
+
 
     def send(self):
         inp = self._chat_input.toPlainText()
@@ -146,9 +193,9 @@ class FrontogetherGui(QMainWindow):
                 attachment = buffer.data().toBase64().toStdString()
                 self._send_screen.setChecked(False)
 
-            self.insert_text(f"\nuser: {inp}\n")
             worker = AgentWorker(self._agent, inp, attachment)
             worker.signals.content.connect(self.insert_text)
+            worker.signals.html.connect(self.insert_html)
             worker.signals.completed.connect(self.completed)
             self._threadpool.start(worker)
 
@@ -156,6 +203,10 @@ class FrontogetherGui(QMainWindow):
         self._chat_input.setText("")
 
 if __name__ == "__main__":
+    format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s'
+    datefmt='%Y-%m-%d %H:%M'
+    logging.basicConfig(level=logging.INFO, format=format, datefmt=datefmt)
+
     app = QApplication(sys.argv)
     window = FrontogetherGui()
     window.show()

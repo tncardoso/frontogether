@@ -12,7 +12,7 @@ class Server:
         self._running = False
 
     def run(self):
-        logging.info("running server at port", self._port)
+        logging.info("running server at port %d", self._port)
         self._running = True
         Handler = http.server.SimpleHTTPRequestHandler
 

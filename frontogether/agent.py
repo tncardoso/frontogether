@@ -5,7 +5,7 @@ import logging
 import litellm
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel
-from typing import List, Callable
+from typing import List, Callable, Any
 
 class FileContent(BaseModel):
     filename: str 
@@ -23,6 +23,7 @@ class Agent:
             loader=FileSystemLoader(prompt_dir),
             autoescape=select_autoescape(),
         )
+        self._model = "claude-3-5-sonnet-20240620"
         self._messages = []
         self._tools = [
             {
@@ -56,7 +57,7 @@ class Agent:
         if output.parent != cwd:
             raise RuntimeError(f"only cwd can be written: {cwd}")
 
-        logging.info(f"writing file:", output)
+        logging.info(f"writing file: %s", output)
         with open(output, "w") as o:
             o.write(content)
 
@@ -72,7 +73,7 @@ class Agent:
                     content = path.read_text()
                     res.append(FileContent(filename=p, content=content))
                 except UnicodeError:
-                    logging.info(f"skipping file:", path)
+                    logging.info(f"skipping file: %s", path)
         return res
 
 
@@ -84,81 +85,98 @@ class Agent:
         })
 
     def _do_call(self,
+                 messages: List[Any],
                  attachment: str = None,
                  progress_callback: Callable[[str], str] = None,
                  progress_tool_callback: Callable[[str], str] = None,
                  finished_callback: Callable[[str], str] = None) -> List[object]:
+
+        # there is a bug with stream=True and function calling
+        # https://github.com/BerriAI/litellm/issues/2716
+        # there are some workarounds in chunk processing
         resp = litellm.completion(
-            model="gpt-4o",
-            messages=self._messages,
+            model=self._model,
+            messages=messages,
             tools=self._tools,
             stream=True,
         )
-        
-        first = True
+
+        tool_calls = []
         chunks = []
         for chunk in resp:
-            chunk_tool_calls = chunk.choices[0].delta.get("tool_calls")
-            chunk_content = chunk.choices[0].delta.get("content")
+            logging.info(chunk)
+            delta = chunk.choices[0].delta
 
-            if progress_callback and chunk_tool_calls == None and chunk_content != None:
-                if first:
-                    progress_callback("\nassistant: ")
-                    first = False
-                progress_callback(chunk_content)
-            elif progress_tool_callback and chunk_tool_calls and len(chunk_tool_calls) > 0:
-                func_name = chunk_tool_calls[0].function.name
-                if func_name:
-                    progress_tool_callback(f"\nfunc({func_name}): ")
-                else:
-                    progress_tool_callback(f".")
+            if delta.content and delta.content != "":
+                if progress_callback:
+                    progress_callback(delta.content)
+
+            raw_tool_calls = delta.get("tool_calls", [])
+            if raw_tool_calls:
+                for tool_call in delta.tool_calls:
+                    logging.info("tool_call %s", str(tool_call))
+                    if tool_call.id:
+                        tool_calls.append(tool_call)
+                        if progress_tool_callback:
+                            progress_tool_callback(f"\nfunc({tool_call.function.name})")
+                    elif tool_call.function.arguments:
+                        tool_calls[-1].function.arguments += tool_call.function.arguments
+                        if progress_tool_callback:
+                            progress_tool_callback(f".")
+
             chunks.append(chunk)
 
         final = litellm.stream_chunk_builder(chunks)
-        tool_calls = final.choices[0].message.get("tool_calls")
+        # append tool_calls because of bug
+        final.choices[0].message.tool_calls = tool_calls
+        logging.info(final)
+        if finished_callback:
+            finished_callback(final.choices[0].message)
 
-        if tool_calls:
-            progress_tool_callback(f"\n")
-            self._messages.append(final.choices[0].message)
-            if finished_callback:
-                finished_callback(final.choices[0].message)
-              
-            for tool_call in tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments)
+        new_messages = []
+        new_messages.append(final.choices[0].message)
 
-                if function_name == "write_file":
-                    function_response = self._tool_write_file(
-                        function_args.get("filename"),
-                        function_args.get("content"),
-                    )
-                else:
-                    raise RuntimeError(f"invalid tool: {function_name}")
+        for tool_call in tool_calls:
+            function_name = tool_call.function.name
+            logging.info(tool_call.function.arguments)
+            function_args = json.loads(tool_call.function.arguments)
 
-                self._messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": function_name,
-                    "content": function_response,
-                })
+            if function_name == "write_file":
+                function_response = self._tool_write_file(
+                    function_args.get("filename"),
+                    function_args.get("content"),
+                )
+            else:
+                raise RuntimeError(f"invalid tool: {function_name}")
 
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": function_name,
+                "content": function_response,
+            }
+
+            new_messages.append(tool_msg)
+
+        ret = Result(
+            messages=new_messages,
+            cost=litellm.completion_cost(final),
+        )
             
+        if len(tool_calls) > 0:
+            # functions were called, get new message
             res = self._do_call(
+                messages=messages + new_messages,
                 attachment=attachment,
                 progress_callback=progress_callback,
                 progress_tool_callback=progress_tool_callback,
                 finished_callback=finished_callback,
             )
 
-            return Result(
-                messages=[final.choices[0].message] + res.messages,
-                cost=litellm.completion_cost(final) + res.cost,
-            )
+            ret.messages += res.messages
+            ret.cost += res.cost
 
-        return Result(
-            messages=[final.choices[0].message],
-            cost=litellm.completion_cost(final),
-        )
+        return ret
 
     def answer(self, content: str,
                attachment:str = None,
@@ -192,12 +210,15 @@ class Agent:
                 "content": prompt,
             })
 
-        return self._do_call(
+        ret = self._do_call(
+            messages=self._messages,
             progress_callback=progress_callback,
             progress_tool_callback=progress_tool_callback,
             finished_callback=finished_callback,
         )
 
+        self._messages += ret.messages
+        return ret
 
 
 if __name__ == "__main__":
